@@ -1,6 +1,7 @@
 #include <Python.h>
 #include "structmember.h"
 #include "hll.h"
+#include "const.h"
 #include "murmur3.h"
 #include <math.h>
 #include <stdint.h>
@@ -10,8 +11,13 @@ typedef struct {
     short int k;      /* size = 2^k */
     uint32_t seed;    /* Murmur3 seed */
     uint32_t size;    /* number of registers */
-    char * registers; /* ranks */
+    char *registers __attribute__ ((aligned (8))); /* ranks */
 } HyperLogLog;
+
+typedef struct {
+    double distance;
+    uint32_t index;
+} Neighbour;
 
 static void
 HyperLogLog_dealloc(HyperLogLog* self)
@@ -89,13 +95,47 @@ HyperLogLog_add(HyperLogLog *self, PyObject *args)
     return Py_None;
 };
 
-/* Gets a cardinality estimate. */
-static PyObject *
-HyperLogLog_cardinality(HyperLogLog *self)
+/* shellsort: sorts v[0] ... v[n-1] in ascending order */
+void shellsort (Neighbour v[MAX_ARRAY_LENGTH], int n)
 {
-    static const double two_32 = 4294967296.0;
-    static const double neg_two_32 = -4294967296.0;
+    int gap, i, j;
+    Neighbour temp;
+    for (gap = n/2; gap > 0; gap /= 2)
+        for (i = gap; i < n; i++)
+            for (j = i - gap;
+                j >= 0 && v[j].distance > v[j + gap].distance; j -= gap) {
 
+                temp = v[j];
+                v[j] = v[j + gap];
+                v[j + gap] = temp;
+            }
+}
+
+double estimate_bias(double E, short int k) {
+    static Neighbour neighbours[MAX_ARRAY_LENGTH];
+    uint32_t i;
+    double x;
+    const double *raw_estimate_data = rawEstimateData[k - 4];
+    uint32_t n = arrayLengths[k - 4];
+
+    for (i = 0; i < n; i++) {
+        x = E - raw_estimate_data[i];
+        neighbours[i].index = i;
+        neighbours[i].distance = x * x;
+    }
+    shellsort(neighbours, n);
+
+    const double *bias_data = biasData[k - 4];
+    double sum = 0.0;
+    for (i = 0; i < KNN_COUNT; i++) {
+        sum += bias_data[neighbours[i].index];
+    }
+
+    return sum / KNN_COUNT;
+}
+
+static double
+correct_estimate(HyperLogLog *self) {
     double alpha = 0.0;
     switch (self->size) {
       case 16:
@@ -111,7 +151,7 @@ HyperLogLog_cardinality(HyperLogLog *self)
 	      alpha = 0.7213/(1.0 + 1.079/(double) self->size);
           break;
     }
-  
+
     uint32_t i;
     double rank;
     double sum = 0.0;
@@ -119,27 +159,113 @@ HyperLogLog_cardinality(HyperLogLog *self)
         rank = (double) self->registers[i];
         sum = sum + pow(2, -1*rank);
     }
-    
-    double estimate = alpha * (1/sum) * self->size * self->size;  
-     
-    if (estimate <= 2.5 * self->size) {
-        uint32_t zeros = 0;
-	    uint32_t i;
 
-	    for (i = 0; i < self->size; i++) {
-    	    if (self->registers[i] == 0) {
-    	        zeros += 1;
+    double E =  alpha * self->size * self->size / sum;
+    return E <= 5 * self->size ? E - estimate_bias(E, self->k) : E;
+}
+
+
+/* Compute SUM(2^-reg) in the dense representation.
+ * PE is an array with a pre-computer table of values 2^-reg indexed by reg.
+ * As a side effect the integer pointed by 'ezp' is set to the number
+ * of zero registers. */
+double hllDenseSum(char *registers, uint32_t size, double *PE, int *ezp) {
+    double E = 0;
+    int j, ez = 0;
+
+    for (j = 0; j < size; j++) {
+            unsigned long reg = registers[j];
+
+            if (reg == 0) {
+                ez++;
+                /* Increment E at the end of the loop. */
+            } else {
+                E += PE[reg]; /* Precomputed 2^(-reg[j]). */
             }
-	    }
-   
-        if (zeros != 0) {
-            double size = (double) self->size;
-            estimate = size * log2(size / (double) zeros);
+    }
+    E += ez; /* Add 2^0 'ez' times. */
+
+    *ezp = ez;
+    return E;
+}
+
+
+/* Gets a cardinality estimate. */
+static PyObject *
+HyperLogLog_cardinality(HyperLogLog *self)
+{
+    double E, alpha = 0.7213/(1+1.079/self->size);
+    uint32_t m = self->size;
+    int j, ez; /* Number of registers equal to 0. */
+
+    /* We precompute 2^(-reg[j]) in a small table in order to
+     * speedup the computation of SUM(2^-register[0..i]). */
+    static int initialized = 0;
+    static double PE[64];
+    if (!initialized) {
+        PE[0] = 1; /* 2^(-reg[j]) is 1 when m is 0. */
+        for (j = 1; j < 64; j++) {
+            /* 2^(-reg[j]) is the same as 1/2^reg[j]. */
+            PE[j] = 1.0/(1ULL << j);
+        }
+        initialized = 1;
+    }
+
+    /* Compute SUM(2^-register[0..i]). */
+    E = hllDenseSum(self->registers,m,PE,&ez);
+
+    /* Muliply the inverse of E for alpha_m * m^2 to have the raw estimate. */
+    E = (1/E)*alpha*m*m;
+
+    /* Use the LINEARCOUNTING algorithm for small cardinalities.
+     * For larger values but up to 72000 HyperLogLog raw approximation is
+     * used since linear counting error starts to increase. However HyperLogLog
+     * shows a strong bias in the range 2.5*16384 - 72000, so we try to
+     * compensate for it. */
+    if (E < m*2.5 && ez != 0) {
+        E = m*log(m/ez); /* LINEARCOUNTING() */
+    } else if (m == 16384 && E < 72000) {
+        /* We did polynomial regression of the bias for this range, this
+         * way we can compute the bias for a given cardinality and correct
+         * according to it. Only apply the correction for P=14 that's what
+         * we use and the value the correction was verified with. */
+        double bias = 5.9119*1.0e-18*(E*E*E*E)
+                      -1.4253*1.0e-12*(E*E*E)+
+                      1.2940*1.0e-7*(E*E)
+                      -5.2921*1.0e-3*E+
+                      83.3216;
+        E -= E*(bias/100);
+    }
+
+    /* We don't apply the correction for E > 1/30 of 2^32 since we use
+     * a 64 bit function and 6 bit counters. To apply the correction for
+     * 1/30 of 2^64 is not needed since it would require a huge set
+     * to approach such a value. */
+    return Py_BuildValue("d", E);
+}
+
+
+
+/* Gets a cardinality estimate. */
+static PyObject *
+HyperLogLog_cardinality2(HyperLogLog *self)
+{
+    uint32_t zeros = 0;
+    uint32_t i;
+
+    for (i = 0; i < self->size; i++) {
+        if (self->registers[i] == 0) {
+            zeros += 1;
         }
     }
 
-    if (estimate > (1.0/30.0) * two_32) {
-        estimate = neg_two_32 * log2(1.0 - estimate/two_32);
+    double estimate;
+    if (zeros > 0) {
+        estimate = self->size * log(self->size / (double)zeros);
+        estimate = estimate <= tresholdData[self->k - 4] ? estimate :
+         correct_estimate(self);
+    } else {
+        estimate = correct_estimate(self);
     }
 
     return Py_BuildValue("d", estimate);

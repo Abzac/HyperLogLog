@@ -39,25 +39,24 @@ class TestCardinalityEstimation(unittest.TestCase):
     def test_small_range_correction_not_all_registers_set_to_zero(self):
         self.hll.set_register(0, 1)
         c = self.hll.cardinality()
-        correction= 1.46571806761 <= c and c <= 1.46571806762
+        correction= 1.01595834606 <= c and c <= 1.01595834608
         self.assertTrue(correction)
 
     def test_medium_range_no_correction(self):
         for i in range(32):
             self.hll.set_register(i, 2)
-
         c = self.hll.cardinality()
-        no_correction = 89.216 <= c and c <= 89.217
+
+        no_correction = 88.707 <= c and c <= 88.709
         self.assertTrue(no_correction)
 
-    @unittest.skip("correction value needs to be re-computed")
+    #@unittest.skip("correction value needs to be re-computed")
     def test_large_range_correction(self):
         hll = HyperLogLog(16)
         for i in range(hll.size() - 1):
             hll.set_register(i, 16)
-
         c = hll.cardinality()
-        correction = 7916284520 <= c and c <= 7916284521
+        correction = 1548966270 <= c and c <= 1548966271
         self.assertTrue(correction)
  
 class TestHyperLogLogConstructor(unittest.TestCase):
