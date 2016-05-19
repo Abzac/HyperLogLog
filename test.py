@@ -39,7 +39,7 @@ class TestCardinalityEstimation(unittest.TestCase):
     def test_small_range_correction_not_all_registers_set_to_zero(self):
         self.hll.set_register(0, 1)
         c = self.hll.cardinality()
-        correction= 1.46571806761 <= c and c <= 1.46571806762
+        correction= 1.01595834606 <= c and c <= 1.01595834607
         self.assertTrue(correction)
 
     def test_medium_range_no_correction(self):
@@ -47,7 +47,7 @@ class TestCardinalityEstimation(unittest.TestCase):
             self.hll.set_register(i, 2)
 
         c = self.hll.cardinality()
-        no_correction = 89.216 <= c and c <= 89.217
+        no_correction = 89.314 <= c <= 89.316
         self.assertTrue(no_correction)
 
     @unittest.skip("correction value needs to be re-computed")
